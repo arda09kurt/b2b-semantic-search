@@ -1,0 +1,12 @@
+# secrets
+.env
+.streamlit/secrets.toml
+
+# large artifacts
+data/embeddings.npz
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
