@@ -9,7 +9,7 @@ The engine understands the intent ("industrial storage racks"), respects the
 constraints ("unit price ≤ $50") and returns the 5 most relevant products
 with AI-written explanations of why each one matches.
 
-**Live demo:** _[add Streamlit Cloud URL after deployment]_
+**Live demo:** https://arda09kurt-b2b-semantic-search-app-cvtmv5.streamlit.app
 
 ---
 
