@@ -16,6 +16,8 @@ HF_FEATURE_EXTRACTION_URL = (
 )
 INDEX_NAME = "b2b-products"
 CANDIDATE_POOL = 25
+RERANK_POOL = 15
+RERANK_DESCRIPTION_CHARS = 200
 TOP_N = 5
 RETRYABLE_STATUS = (429, 500, 502, 503)
 
@@ -39,7 +41,9 @@ Candidate products (JSON):
 {candidates}
 
 Pick the {top_n} products that BEST satisfy the buyer's intent (relevance first,
-then value). Respond with ONLY a JSON object, no markdown:
+then value). Each reason must be one self-contained sentence about that product
+only — never mention or compare against other products. Respond with ONLY a JSON
+object, no markdown:
 {{"picks": [{{"id": "<product id>", "reason": "<one short sentence: why this fits the buyer's need>"}}]}}"""
 
 
@@ -77,25 +81,33 @@ def get_secret(name: str) -> str:
         return ""
 
 
-def groq_json(prompt: str, api_key: str) -> dict | None:
-    try:
-        response = requests.post(
-            GROQ_CHAT_URL,
-            headers={"Authorization": f"Bearer {api_key}"},
-            json={
-                "model": GROQ_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0,
-                "response_format": {"type": "json_object"},
-            },
-            timeout=45,
-        )
-        response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
-        match = re.search(r"\{.*\}", content, re.DOTALL)
-        return json.loads(match.group(0)) if match else None
-    except Exception:
-        return None
+def groq_json(prompt: str, api_key: str, attempts: int = 3) -> dict | None:
+    for attempt in range(attempts):
+        try:
+            response = requests.post(
+                GROQ_CHAT_URL,
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0,
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=45,
+            )
+            if response.status_code == 429:
+                retry_after = float(response.headers.get("retry-after", 2))
+                time.sleep(min(retry_after + 0.5, 15))
+                continue
+            response.raise_for_status()
+            content = response.json()["choices"][0]["message"]["content"]
+            match = re.search(r"\{.*\}", content, re.DOTALL)
+            if match:
+                return json.loads(match.group(0))
+        except Exception:
+            if attempt + 1 < attempts:
+                time.sleep(1.5)
+    return None
 
 
 def embed_query(text: str, hf_token: str) -> list[float]:
@@ -146,6 +158,15 @@ def build_metadata_filter(parsed: dict) -> dict | None:
     return clauses[0] if len(clauses) == 1 else {"$and": clauses}
 
 
+def dedupe_by_name(candidates: list[SearchResult]) -> list[SearchResult]:
+    unique: dict[str, SearchResult] = {}
+    for candidate in candidates:
+        key = candidate.name.strip().lower()
+        if key not in unique:
+            unique[key] = candidate
+    return list(unique.values())
+
+
 def to_result(match) -> SearchResult:
     metadata = dict(match.metadata or {})
     return SearchResult(
@@ -164,6 +185,7 @@ def to_result(match) -> SearchResult:
 def rerank(query: str, candidates: list[SearchResult], groq_key: str) -> list[SearchResult] | None:
     if not groq_key or not candidates:
         return None
+    pool = candidates[:RERANK_POOL]
     payload = [
         {
             "id": candidate.id,
@@ -172,9 +194,9 @@ def rerank(query: str, candidates: list[SearchResult], groq_key: str) -> list[Se
             "brand": candidate.brand,
             "price_usd": candidate.price_usd,
             "moq": candidate.moq,
-            "description": candidate.description[:300],
+            "description": candidate.description[:RERANK_DESCRIPTION_CHARS],
         }
-        for candidate in candidates
+        for candidate in pool
     ]
     output = groq_json(
         RERANK_PROMPT.format(
@@ -219,7 +241,7 @@ def search(query: str) -> SearchResponse:
             filter=build_metadata_filter(parsed),
             include_metadata=True,
         ).matches
-        candidates = [to_result(match) for match in matches]
+        candidates = dedupe_by_name([to_result(match) for match in matches])
 
         picked = rerank(query, candidates, groq_key)
         if picked:
