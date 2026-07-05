@@ -1,4 +1,4 @@
-# 📦 Semantic B2B Wholesale Product Search Engine
+# Semantic B2B Wholesale Product Search Engine
 
 A search engine that lets wholesale buyers find products using **natural,
 conversational language** instead of strict keywords — e.g.

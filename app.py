@@ -1,151 +1,214 @@
-"""
-Step 5 — UI & Deployment
-=========================
-Streamlit frontend for the Semantic B2B Wholesale Product Search Engine.
-
-Run locally:
-    streamlit run app.py
-
-Secrets (env vars or .streamlit/secrets.toml):
-    HF_TOKEN, PINECONE_API_KEY, GROQ_API_KEY
-"""
+import html
 
 import streamlit as st
 
-from search import SearchResponse, search
+from search import SearchResponse, SearchResult, search
 
 st.set_page_config(
-    page_title="B2B Wholesale Semantic Search",
-    page_icon="📦",
-    layout="wide",
+    page_title="Wholesale Product Search",
+    layout="centered",
+    initial_sidebar_state="collapsed",
 )
 
 EXAMPLE_QUERIES = [
-    "heavy duty warehouse shelving under $50 per unit",
-    "comfortable cotton t-shirts for a retail store, need about 100 units",
-    "elegant silver jewellery for a boutique under $10",
-    "durable kitchen storage containers in bulk",
-    "leather office chairs under $200",
+    "Heavy duty warehouse shelving under $50 per unit",
+    "Cotton t-shirts for a retail store, around 100 units",
+    "Silver jewellery for a boutique under $10",
+    "Kitchen storage containers in bulk",
 ]
 
+STYLES = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+html, body, [class*="css"], .stApp, p, div, input, button {
+    font-family: 'Inter', -apple-system, 'Segoe UI', sans-serif;
+}
+#MainMenu, footer, header[data-testid="stHeader"] { visibility: hidden; }
+.block-container { padding-top: 3.5rem; max-width: 860px; }
+
+.hero-title {
+    font-size: 2.1rem; font-weight: 800; letter-spacing: -0.03em;
+    color: #0f172a; margin-bottom: 0.2rem;
+}
+.hero-subtitle { color: #64748b; font-size: 1.02rem; margin-bottom: 1.6rem; }
+
+.stTextInput input {
+    border-radius: 10px; border: 1.5px solid #e2e8f0; padding: 0.85rem 1rem;
+    font-size: 1rem; background: #ffffff;
+}
+.stTextInput input:focus { border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12); }
+
+div[data-testid="stButton"] button {
+    border-radius: 999px; border: 1px solid #e2e8f0; background: #ffffff;
+    color: #475569; font-size: 0.82rem; font-weight: 500; padding: 0.3rem 0.9rem;
+}
+div[data-testid="stButton"] button:hover { border-color: #2563eb; color: #2563eb; background: #eff6ff; }
+
+.query-summary {
+    background: #f1f5f9; border-radius: 10px; padding: 0.7rem 1rem;
+    font-size: 0.9rem; color: #334155; margin: 1rem 0 1.4rem 0;
+}
+.query-summary .constraint {
+    display: inline-block; background: #ffffff; border: 1px solid #e2e8f0;
+    border-radius: 6px; padding: 0.1rem 0.55rem; margin-left: 0.45rem;
+    font-weight: 600; color: #0f172a; font-size: 0.82rem;
+}
+
+.results-heading {
+    font-size: 0.8rem; font-weight: 700; letter-spacing: 0.08em;
+    text-transform: uppercase; color: #94a3b8; margin: 0.4rem 0 0.9rem 0;
+}
+
+.product-card {
+    background: #ffffff; border: 1px solid #e8edf3; border-radius: 14px;
+    padding: 1.25rem 1.4rem; margin-bottom: 0.9rem;
+    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.05);
+}
+.product-card .top-row { display: flex; justify-content: space-between; gap: 1rem; align-items: flex-start; }
+.product-card .rank { color: #94a3b8; font-weight: 600; font-size: 0.85rem; margin-right: 0.5rem; }
+.product-card .name { font-weight: 700; font-size: 1.05rem; color: #0f172a; line-height: 1.35; }
+.product-card .meta { margin: 0.55rem 0 0.75rem 0; }
+.product-card .pill {
+    display: inline-block; background: #f8fafc; border: 1px solid #eef2f7;
+    color: #64748b; border-radius: 6px; font-size: 0.76rem; font-weight: 500;
+    padding: 0.12rem 0.55rem; margin-right: 0.4rem;
+}
+.product-card .price { font-size: 1.25rem; font-weight: 800; color: #0f172a; white-space: nowrap; }
+.product-card .price small { font-size: 0.78rem; font-weight: 500; color: #94a3b8; }
+.product-card .moq {
+    font-size: 0.82rem; color: #475569; font-weight: 600;
+    text-align: right; margin-top: 0.15rem;
+}
+.product-card .reason {
+    border-left: 3px solid #2563eb; background: #f8fafc; color: #475569;
+    font-size: 0.88rem; padding: 0.55rem 0.85rem; border-radius: 0 8px 8px 0;
+    margin-top: 0.35rem;
+}
+.product-card details { margin-top: 0.7rem; }
+.product-card summary {
+    cursor: pointer; font-size: 0.82rem; font-weight: 600; color: #2563eb;
+    list-style: none;
+}
+.product-card details p {
+    font-size: 0.86rem; color: #64748b; line-height: 1.55; margin-top: 0.5rem;
+}
+.notice { color: #94a3b8; font-size: 0.84rem; margin-bottom: 0.8rem; }
+</style>
+"""
+
+st.markdown(STYLES, unsafe_allow_html=True)
+
+
+def set_query(value: str) -> None:
+    st.session_state.query_input = value
+
+
+def format_constraints(parsed: dict) -> str:
+    chips = []
+    if parsed.get("max_price") is not None:
+        chips.append(f'<span class="constraint">Max ${parsed["max_price"]:,.0f} / unit</span>')
+    if parsed.get("min_price") is not None:
+        chips.append(f'<span class="constraint">Min ${parsed["min_price"]:,.0f} / unit</span>')
+    if parsed.get("max_moq") is not None:
+        chips.append(f'<span class="constraint">MOQ up to {parsed["max_moq"]:,.0f}</span>')
+    return "".join(chips)
+
+
+def render_query_summary(parsed: dict, fallback_query: str) -> None:
+    understood = html.escape(parsed.get("semantic_query") or fallback_query)
+    st.markdown(
+        f'<div class="query-summary">Interpreted as <strong>{understood}</strong>'
+        f"{format_constraints(parsed)}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_card(rank: int, result: SearchResult) -> None:
+    reason_block = (
+        f'<div class="reason">{html.escape(result.reason)}</div>' if result.reason else ""
+    )
+    st.markdown(
+        f"""
+        <div class="product-card">
+          <div class="top-row">
+            <div>
+              <span class="rank">{rank:02d}</span>
+              <span class="name">{html.escape(result.name)}</span>
+              <div class="meta">
+                <span class="pill">{html.escape(result.category)}</span>
+                <span class="pill">{html.escape(result.brand)}</span>
+                <span class="pill">{result.score * 100:.0f}% match</span>
+              </div>
+            </div>
+            <div>
+              <div class="price">${result.price_usd:,.2f} <small>/ unit</small></div>
+              <div class="moq">MOQ {result.moq:,} units</div>
+            </div>
+          </div>
+          {reason_block}
+          <details>
+            <summary>Product details</summary>
+            <p>{html.escape(result.description)}</p>
+          </details>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+st.markdown('<div class="hero-title">Wholesale Product Search</div>', unsafe_allow_html=True)
 st.markdown(
-    """
-    <style>
-    .product-card {
-        border: 1px solid rgba(128, 128, 128, 0.35);
-        border-radius: 12px;
-        padding: 1rem 1.2rem;
-        margin-bottom: 1rem;
-        background: rgba(128, 128, 128, 0.06);
-    }
-    .price-tag { font-size: 1.3rem; font-weight: 700; color: #16a34a; }
-    .moq-tag { color: #b45309; font-weight: 600; }
-    .reason { font-style: italic; opacity: 0.85; }
-    .badge {
-        display: inline-block; padding: 0.1rem 0.6rem; border-radius: 999px;
-        background: rgba(59, 130, 246, 0.15); font-size: 0.8rem; margin-right: 0.4rem;
-    }
-    </style>
-    """,
+    '<div class="hero-subtitle">Describe what you need in plain language — '
+    "semantic search across 17,000+ products with AI-ranked results.</div>",
     unsafe_allow_html=True,
 )
 
-st.title("📦 B2B Wholesale Semantic Search")
-st.caption(
-    "Search 17,000+ wholesale products in plain English — powered by "
-    "AI embeddings (HuggingFace), vector search (Pinecone) and an LLM re-ranker (Groq)."
+query = st.text_input(
+    "Search",
+    key="query_input",
+    placeholder="e.g. heavy duty warehouse shelving under $50 per unit",
+    label_visibility="collapsed",
 )
+
+columns = st.columns(len(EXAMPLE_QUERIES))
+for column, example in zip(columns, EXAMPLE_QUERIES):
+    column.button(
+        example,
+        key=f"example-{example}",
+        on_click=set_query,
+        args=(example,),
+        use_container_width=True,
+    )
 
 with st.sidebar:
-    st.header("How it works")
+    st.markdown("#### How it works")
     st.markdown(
-        "1. 🧠 **LLM** (Groq · Llama 3.3) reads your query and extracts "
-        "price / quantity constraints\n"
-        "2. 🔢 Your query becomes a **vector embedding** (all-MiniLM-L6-v2)\n"
-        "3. 🎯 **Pinecone** finds the most semantically similar products\n"
-        "4. 🏆 The LLM re-ranks them and explains each match\n"
+        "1. A large language model (Groq, Llama 3.3) extracts price and "
+        "quantity constraints from your query\n"
+        "2. The query is converted to a vector embedding (all-MiniLM-L6-v2)\n"
+        "3. Pinecone retrieves the most semantically similar products\n"
+        "4. The model re-ranks results and explains each match"
     )
-    st.divider()
-    st.markdown(
-        "**Try queries like:**\n"
-        + "\n".join(f"- *{q}*" for q in EXAMPLE_QUERIES[:3])
-    )
-
-if "query" not in st.session_state:
-    st.session_state.query = ""
-
-query = st.text_input(
-    "What are you sourcing today?",
-    value=st.session_state.query,
-    placeholder="e.g. heavy duty warehouse shelving under $50 per unit",
-    key="search_box",
-)
-
-cols = st.columns(len(EXAMPLE_QUERIES))
-for col, example in zip(cols, EXAMPLE_QUERIES):
-    if col.button(example[:32] + "…", key=example, use_container_width=True):
-        query = example
-        st.session_state.query = example
-
-
-def render_result(rank: int, r) -> None:
-    with st.container():
-        st.markdown('<div class="product-card">', unsafe_allow_html=True)
-        img_col, body_col = st.columns([1, 5])
-        with img_col:
-            if r.image_url:
-                st.image(r.image_url, use_container_width=True)
-            else:
-                st.markdown("### 📦")
-        with body_col:
-            st.markdown(f"**{rank}. {r.name}**")
-            st.markdown(
-                f'<span class="badge">{r.category}</span>'
-                f'<span class="badge">{r.brand}</span>'
-                f'<span class="badge">match {r.score:.2f}</span>',
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f'<span class="price-tag">${r.price_usd:,.2f}</span> / unit &nbsp;·&nbsp; '
-                f'<span class="moq-tag">MOQ: {r.moq} units</span>',
-                unsafe_allow_html=True,
-            )
-            if r.reason:
-                st.markdown(f'<p class="reason">🤖 {r.reason}</p>', unsafe_allow_html=True)
-            with st.expander("Product details"):
-                st.write(r.description)
-        st.markdown("</div>", unsafe_allow_html=True)
-
 
 if query.strip():
-    with st.spinner("Searching the catalog semantically…"):
+    with st.spinner("Searching the catalog"):
         response: SearchResponse = search(query)
 
     if response.error:
         st.error(f"Search failed: {response.error}")
     elif not response.results:
-        st.warning(
-            "No products matched those constraints. "
-            "Try loosening the price or quantity limits."
-        )
+        st.warning("No products matched those constraints. Try loosening the price or quantity limits.")
     else:
-        parsed = response.parsed or {}
-        chips = []
-        if parsed.get("max_price") is not None:
-            chips.append(f"max ${parsed['max_price']:,.0f}/unit")
-        if parsed.get("min_price") is not None:
-            chips.append(f"min ${parsed['min_price']:,.0f}/unit")
-        if parsed.get("max_moq") is not None:
-            chips.append(f"MOQ ≤ {parsed['max_moq']:,.0f}")
-        understood = f"Understood: **{parsed.get('semantic_query', query)}**"
-        if chips:
-            understood += " · " + " · ".join(chips)
-        st.markdown(understood)
+        render_query_summary(response.parsed or {}, query)
         if not response.llm_used:
-            st.caption("ℹ️ Showing raw similarity ranking (LLM re-ranker unavailable).")
-
-        st.subheader(f"Top {len(response.results)} matches")
+            st.markdown(
+                '<div class="notice">Showing similarity ranking — AI re-ranking unavailable.</div>',
+                unsafe_allow_html=True,
+            )
+        st.markdown(
+            f'<div class="results-heading">Top {len(response.results)} results</div>',
+            unsafe_allow_html=True,
+        )
         for rank, result in enumerate(response.results, start=1):
-            render_result(rank, result)
-else:
-    st.info("Type what you need above — natural language works best. 👆")
+            render_card(rank, result)

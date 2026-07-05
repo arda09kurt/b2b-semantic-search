@@ -1,21 +1,3 @@
-"""
-Step 4 — Search Logic
-======================
-Turns a natural-language buyer query into ranked product results:
-
-1. A Groq LLM parses the query into a clean semantic search phrase plus hard
-   constraints (max price, max MOQ, quantity needed).
-2. The query is embedded with the same free HuggingFace model used for the
-   catalog (``all-MiniLM-L6-v2``).
-3. Pinecone performs a cosine similarity search, applying the hard
-   constraints as metadata filters.
-4. The Groq LLM re-ranks the candidates and explains, per product, why it
-   matches — the top 5 are returned.
-
-Every step degrades gracefully: if the LLM is unavailable the raw vector
-ranking is returned; the app never shows an empty error page.
-"""
-
 from __future__ import annotations
 
 import json
@@ -28,9 +10,14 @@ import requests
 
 EMBED_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
 GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+HF_FEATURE_EXTRACTION_URL = (
+    f"https://router.huggingface.co/hf-inference/models/{EMBED_MODEL_ID}/pipeline/feature-extraction"
+)
 INDEX_NAME = "b2b-products"
-CANDIDATES = 25          # vectors fetched from Pinecone
-TOP_N = 5                # results shown to the buyer
+CANDIDATE_POOL = 25
+TOP_N = 5
+RETRYABLE_STATUS = (429, 500, 502, 503)
 
 PARSE_PROMPT = """\
 You parse wholesale product search queries for a B2B marketplace.
@@ -78,11 +65,10 @@ class SearchResponse:
     error: str = ""
 
 
-def _get_key(name: str) -> str:
-    """Read a key from the environment, falling back to Streamlit secrets."""
-    val = os.environ.get(name, "")
-    if val:
-        return val
+def get_secret(name: str) -> str:
+    value = os.environ.get(name, "")
+    if value:
+        return value
     try:
         import streamlit as st
 
@@ -91,11 +77,10 @@ def _get_key(name: str) -> str:
         return ""
 
 
-def _groq_json(prompt: str, api_key: str) -> dict | None:
-    """Call Groq chat completion and parse a JSON object out of the reply."""
+def groq_json(prompt: str, api_key: str) -> dict | None:
     try:
-        resp = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
+        response = requests.post(
+            GROQ_CHAT_URL,
             headers={"Authorization": f"Bearer {api_key}"},
             json={
                 "model": GROQ_MODEL,
@@ -105,8 +90,8 @@ def _groq_json(prompt: str, api_key: str) -> dict | None:
             },
             timeout=45,
         )
-        resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
+        response.raise_for_status()
+        content = response.json()["choices"][0]["message"]["content"]
         match = re.search(r"\{.*\}", content, re.DOTALL)
         return json.loads(match.group(0)) if match else None
     except Exception:
@@ -114,50 +99,46 @@ def _groq_json(prompt: str, api_key: str) -> dict | None:
 
 
 def embed_query(text: str, hf_token: str) -> list[float]:
-    """Embed a single query string with the free HuggingFace Inference API."""
-    url = (
-        "https://router.huggingface.co/hf-inference/models/"
-        f"{EMBED_MODEL_ID}/pipeline/feature-extraction"
-    )
     headers = {"Authorization": f"Bearer {hf_token}"}
-    last_err = ""
+    last_error = ""
     for attempt in range(4):
-        resp = requests.post(url, headers=headers, json={"inputs": [text]}, timeout=60)
-        if resp.status_code == 200:
-            vec = resp.json()[0]
-            norm = sum(v * v for v in vec) ** 0.5 or 1.0
-            return [v / norm for v in vec]
-        last_err = f"HF API {resp.status_code}"
-        if resp.status_code in (429, 500, 502, 503):
+        response = requests.post(
+            HF_FEATURE_EXTRACTION_URL, headers=headers, json={"inputs": [text]}, timeout=60
+        )
+        if response.status_code == 200:
+            vector = response.json()[0]
+            norm = sum(v * v for v in vector) ** 0.5 or 1.0
+            return [v / norm for v in vector]
+        last_error = f"HF API {response.status_code}"
+        if response.status_code in RETRYABLE_STATUS:
             time.sleep(2**attempt)
             continue
         break
-    raise RuntimeError(f"Query embedding failed ({last_err})")
+    raise RuntimeError(f"Query embedding failed ({last_error})")
 
 
 def parse_query(query: str, groq_key: str) -> dict:
-    """LLM extraction of constraints; falls back to the raw query."""
     fallback = {"semantic_query": query, "max_price": None, "min_price": None, "max_moq": None}
     if not groq_key:
         return fallback
-    parsed = _groq_json(PARSE_PROMPT.format(query=query), groq_key)
+    parsed = groq_json(PARSE_PROMPT.format(query=query), groq_key)
     if not parsed or not parsed.get("semantic_query"):
         return fallback
-    for k in ("max_price", "min_price", "max_moq"):
-        v = parsed.get(k)
-        parsed[k] = float(v) if isinstance(v, (int, float)) else None
+    for key in ("max_price", "min_price", "max_moq"):
+        value = parsed.get(key)
+        parsed[key] = float(value) if isinstance(value, (int, float)) else None
     return parsed
 
 
-def _metadata_filter(parsed: dict) -> dict | None:
+def build_metadata_filter(parsed: dict) -> dict | None:
     clauses = []
-    price = {}
+    price_bounds = {}
     if parsed.get("max_price") is not None:
-        price["$lte"] = parsed["max_price"]
+        price_bounds["$lte"] = parsed["max_price"]
     if parsed.get("min_price") is not None:
-        price["$gte"] = parsed["min_price"]
-    if price:
-        clauses.append({"price_usd": price})
+        price_bounds["$gte"] = parsed["min_price"]
+    if price_bounds:
+        clauses.append({"price_usd": price_bounds})
     if parsed.get("max_moq") is not None:
         clauses.append({"moq": {"$lte": parsed["max_moq"]}})
     if not clauses:
@@ -165,89 +146,87 @@ def _metadata_filter(parsed: dict) -> dict | None:
     return clauses[0] if len(clauses) == 1 else {"$and": clauses}
 
 
-def _to_result(match) -> SearchResult:
-    md = dict(match.metadata or {})
+def to_result(match) -> SearchResult:
+    metadata = dict(match.metadata or {})
     return SearchResult(
         id=str(match.id),
-        name=md.get("name", ""),
-        description=md.get("description", ""),
-        price_usd=float(md.get("price_usd", 0)),
-        moq=int(md.get("moq", 1)),
-        category=md.get("category", ""),
-        brand=md.get("brand", ""),
-        image_url=md.get("image_url", ""),
+        name=metadata.get("name", ""),
+        description=metadata.get("description", ""),
+        price_usd=float(metadata.get("price_usd", 0)),
+        moq=int(metadata.get("moq", 1)),
+        category=metadata.get("category", ""),
+        brand=metadata.get("brand", ""),
+        image_url=metadata.get("image_url", ""),
         score=float(match.score or 0),
     )
 
 
 def rerank(query: str, candidates: list[SearchResult], groq_key: str) -> list[SearchResult] | None:
-    """LLM picks and explains the top N; returns None if the LLM fails."""
     if not groq_key or not candidates:
         return None
     payload = [
         {
-            "id": c.id,
-            "name": c.name,
-            "category": c.category,
-            "brand": c.brand,
-            "price_usd": c.price_usd,
-            "moq": c.moq,
-            "description": c.description[:300],
+            "id": candidate.id,
+            "name": candidate.name,
+            "category": candidate.category,
+            "brand": candidate.brand,
+            "price_usd": candidate.price_usd,
+            "moq": candidate.moq,
+            "description": candidate.description[:300],
         }
-        for c in candidates
+        for candidate in candidates
     ]
-    out = _groq_json(
+    output = groq_json(
         RERANK_PROMPT.format(
             query=query, candidates=json.dumps(payload, ensure_ascii=False), top_n=TOP_N
         ),
         groq_key,
     )
-    if not out or not isinstance(out.get("picks"), list):
+    if not output or not isinstance(output.get("picks"), list):
         return None
-    by_id = {c.id: c for c in candidates}
+    by_id = {candidate.id: candidate for candidate in candidates}
     picked = []
-    for pick in out["picks"][:TOP_N]:
-        c = by_id.get(str(pick.get("id", "")))
-        if c:
-            c.reason = str(pick.get("reason", ""))[:300]
-            picked.append(c)
+    for pick in output["picks"][:TOP_N]:
+        candidate = by_id.get(str(pick.get("id", "")))
+        if candidate:
+            candidate.reason = str(pick.get("reason", ""))[:300]
+            picked.append(candidate)
     return picked or None
 
 
 def search(query: str) -> SearchResponse:
-    """Full pipeline: parse -> embed -> vector search -> LLM re-rank."""
     from pinecone import Pinecone
 
-    hf_token = _get_key("HF_TOKEN")
-    pinecone_key = _get_key("PINECONE_API_KEY")
-    groq_key = _get_key("GROQ_API_KEY")
+    hf_token = get_secret("HF_TOKEN")
+    pinecone_key = get_secret("PINECONE_API_KEY")
+    groq_key = get_secret("GROQ_API_KEY")
 
-    resp = SearchResponse()
+    response = SearchResponse()
     if not query.strip():
-        return resp
+        return response
     if not (hf_token and pinecone_key):
-        resp.error = "Missing HF_TOKEN or PINECONE_API_KEY — check your secrets."
-        return resp
+        response.error = "Missing HF_TOKEN or PINECONE_API_KEY. Check your secrets configuration."
+        return response
 
     try:
         parsed = parse_query(query, groq_key)
-        resp.parsed = parsed
+        response.parsed = parsed
         vector = embed_query(parsed["semantic_query"], hf_token)
         index = Pinecone(api_key=pinecone_key).Index(INDEX_NAME)
         matches = index.query(
             vector=vector,
-            top_k=CANDIDATES,
-            filter=_metadata_filter(parsed),
+            top_k=CANDIDATE_POOL,
+            filter=build_metadata_filter(parsed),
             include_metadata=True,
         ).matches
-        candidates = [_to_result(m) for m in matches]
+        candidates = [to_result(match) for match in matches]
 
         picked = rerank(query, candidates, groq_key)
         if picked:
-            resp.results = picked
-            resp.llm_used = True
+            response.results = picked
+            response.llm_used = True
         else:
-            resp.results = candidates[:TOP_N]
-    except Exception as exc:  # surface a friendly message, never a stack trace
-        resp.error = str(exc)
-    return resp
+            response.results = candidates[:TOP_N]
+    except Exception as exc:
+        response.error = str(exc)
+    return response

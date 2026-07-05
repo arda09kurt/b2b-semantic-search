@@ -1,25 +1,3 @@
-"""
-Step 1 — Data Sourcing & Preparation
-=====================================
-Downloads the Flipkart Products dataset from Kaggle (20,000 real e-commerce
-products with names, descriptions and prices) and prepares it for the
-wholesale semantic search engine.
-
-Dataset: https://www.kaggle.com/datasets/PromptCloudHQ/flipkart-products
-
-Note on MOQ: public Kaggle datasets with a *native* MOQ column top out at
-~1,000 rows (small Alibaba scrapes), which fails the 5,000+ product
-requirement. To satisfy both requirements we use this real 20K-product
-dataset and derive a deterministic wholesale MOQ per product from its price
-band and a stable hash of its product ID (reproducible on every run).
-
-Usage:
-    python scripts/prepare_data.py
-
-Output:
-    data/products.csv  (cleaned, ~19K products)
-"""
-
 import hashlib
 import os
 import re
@@ -27,89 +5,94 @@ import re
 import kagglehub
 import pandas as pd
 
-INR_TO_USD = 1 / 83.0  # fixed conversion rate used for the whole catalog
+KAGGLE_DATASET = "PromptCloudHQ/flipkart-products"
+SOURCE_FILENAME = "flipkart_com-ecommerce_sample.csv"
+INR_TO_USD = 1 / 83.0
+MIN_DESCRIPTION_LENGTH = 40
+MIN_CATALOG_SIZE = 5000
+MAX_DESCRIPTION_CHARS = 2000
 
-OUT_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "products.csv")
-
-# Wholesale MOQ options per unit-price band (USD). Cheaper items are sold in
-# larger minimum quantities, matching real B2B marketplace behaviour.
 MOQ_BANDS = [
-    (2.0, [100, 200, 500]),      # < $2
-    (10.0, [50, 100, 200]),      # $2 - $10
-    (50.0, [20, 50, 100]),       # $10 - $50
-    (200.0, [5, 10, 20]),        # $50 - $200
-    (float("inf"), [1, 2, 5]),   # > $200
+    (2.0, [100, 200, 500]),
+    (10.0, [50, 100, 200]),
+    (50.0, [20, 50, 100]),
+    (200.0, [5, 10, 20]),
+    (float("inf"), [1, 2, 5]),
 ]
 
+OUTPUT_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "products.csv")
 
-def stable_pick(key: str, options: list) -> int:
-    """Deterministically pick an option based on a stable hash of the key."""
+
+def stable_pick(key: str, options: list[int]) -> int:
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
     return options[int(digest, 16) % len(options)]
 
 
 def derive_moq(product_id: str, price_usd: float) -> int:
-    for threshold, options in MOQ_BANDS:
-        if price_usd < threshold:
+    for upper_bound, options in MOQ_BANDS:
+        if price_usd < upper_bound:
             return stable_pick(product_id, options)
     return 1
 
 
-def top_category(tree: str) -> str:
-    """Extract the top-level category from Flipkart's category tree string."""
-    if not isinstance(tree, str):
+def top_category(category_tree: str) -> str:
+    if not isinstance(category_tree, str):
         return "General"
-    cleaned = tree.strip().strip("[]").strip('"')
+    cleaned = category_tree.strip().strip("[]").strip('"')
     return cleaned.split(">>")[0].strip() or "General"
 
 
-def first_image(images: str) -> str:
-    if not isinstance(images, str):
+def first_image(image_list: str) -> str:
+    if not isinstance(image_list, str):
         return ""
-    match = re.search(r'"(https?://[^"]+)"', images)
+    match = re.search(r'"(https?://[^"]+)"', image_list)
     return match.group(1) if match else ""
 
 
-def clean_text(text: str) -> str:
-    text = re.sub(r"\s+", " ", str(text)).strip()
-    return text
+def normalize_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text)).strip()
+
+
+def load_source() -> pd.DataFrame:
+    path = kagglehub.dataset_download(KAGGLE_DATASET)
+    return pd.read_csv(os.path.join(path, SOURCE_FILENAME))
+
+
+def build_catalog(raw: pd.DataFrame) -> pd.DataFrame:
+    rows = raw.dropna(subset=["product_name", "description", "retail_price"])
+    rows = rows.drop_duplicates(subset=["product_name", "description"])
+    rows = rows[rows["description"].str.len() >= MIN_DESCRIPTION_LENGTH]
+
+    catalog = pd.DataFrame()
+    catalog["product_id"] = rows["uniq_id"]
+    catalog["name"] = rows["product_name"].map(normalize_whitespace)
+    catalog["description"] = (
+        rows["description"].map(normalize_whitespace).str.slice(0, MAX_DESCRIPTION_CHARS)
+    )
+    catalog["price_usd"] = (rows["retail_price"] * INR_TO_USD).round(2)
+    catalog["category"] = rows["product_category_tree"].map(top_category)
+    catalog["brand"] = rows["brand"].fillna("Unbranded").map(normalize_whitespace)
+    catalog["image_url"] = rows["image"].map(first_image)
+    catalog["moq"] = [
+        derive_moq(product_id, price)
+        for product_id, price in zip(catalog["product_id"], catalog["price_usd"])
+    ]
+    return catalog
 
 
 def main() -> None:
-    print("Downloading Flipkart products dataset from Kaggle...")
-    path = kagglehub.dataset_download("PromptCloudHQ/flipkart-products")
-    csv_path = os.path.join(path, "flipkart_com-ecommerce_sample.csv")
-    df = pd.read_csv(csv_path)
-    print(f"Raw rows: {len(df)}")
+    print(f"Downloading {KAGGLE_DATASET} from Kaggle...")
+    raw = load_source()
+    print(f"Raw rows: {len(raw)}")
 
-    # Keep rows with the fields the search engine needs.
-    df = df.dropna(subset=["product_name", "description", "retail_price"])
-    df = df.drop_duplicates(subset=["product_name", "description"])
+    catalog = build_catalog(raw)
 
-    # Drop rows whose description is too short to embed meaningfully.
-    df = df[df["description"].str.len() >= 40]
+    assert len(catalog) >= MIN_CATALOG_SIZE, f"Expected {MIN_CATALOG_SIZE}+ products, got {len(catalog)}"
+    assert catalog[["name", "description", "price_usd", "moq"]].notna().all().all()
 
-    out = pd.DataFrame()
-    out["product_id"] = df["uniq_id"]
-    out["name"] = df["product_name"].map(clean_text)
-    out["description"] = df["description"].map(clean_text).str.slice(0, 2000)
-    out["price_usd"] = (df["retail_price"] * INR_TO_USD).round(2)
-    out["category"] = df["product_category_tree"].map(top_category)
-    out["brand"] = df["brand"].fillna("Unbranded").map(clean_text)
-    out["image_url"] = df["image"].map(first_image)
-    out["moq"] = [
-        derive_moq(pid, price)
-        for pid, price in zip(out["product_id"], out["price_usd"])
-    ]
-
-    # Sanity checks required by the project spec.
-    assert len(out) >= 5000, f"Need 5,000+ products, got {len(out)}"
-    assert out[["name", "description", "price_usd", "moq"]].notna().all().all()
-
-    os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
-    out.to_csv(OUT_PATH, index=False)
-    print(f"Wrote {len(out)} products -> {os.path.abspath(OUT_PATH)}")
-    print(out[["name", "price_usd", "moq", "category"]].head(10).to_string())
+    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+    catalog.to_csv(OUTPUT_PATH, index=False)
+    print(f"Wrote {len(catalog)} products -> {os.path.abspath(OUTPUT_PATH)}")
 
 
 if __name__ == "__main__":
